@@ -1,14 +1,24 @@
+"""
+FlySpotter: Script to automate Drosophila starvation assays
+
+Takes the top image directory as input and outputs a CSV file with the date of death for each fly in a well
+
+@see run() and main()
+"""
+
 import os
 from pathlib import Path
 import numpy as np
 from math import sqrt
 from parse import parse
 import cv2 as cv
-from find_fly import find_fly
 from csv import writer
 from datetime import datetime
 from typing import List, Tuple, Optional
 from tqdm import tqdm
+
+# CONSTANTS
+SQRT_2 = np.sqrt(2.)
 
 # FORMAT STRINGS
 
@@ -18,6 +28,146 @@ dir_format_str = "{plate_y:1d}-{plate_x:1d}-{well_alpha:l}{well_num:1d}"
 image_format_str = "{img_number:d}-{plate_y:1d}-{plate_x:1d}-{well_alpha:l}{well_num:1d}-{year:4d}_{month:2d}_{day:2d}_{hour:2d}_{minute:2d}_{second:2d}-0"
 # Output CSV date format
 date_format_str = "%Y-%m-%d %H:%M:%S"
+
+
+def find_fly(image_path: str,
+             crop_margin=-10,
+             min_circle_radius=200,
+             max_circle_radius=400,
+             circle_radius_override=250,
+             draw_debug_crop=False,
+             draw_debug_threshold=False,
+             draw_debug_contours=False,
+             draw_debug_result=False,
+             return_debug_result=False) -> Optional[Tuple[int, int]]:
+    """
+    Finds the position of a fly in an image, by first cropping to a standard size. Defaults tested on 800x600 image size
+    :param image_path: path to the image
+    :param crop_margin: margin around plate circle to use for cropping to standard size (in pixels)
+    :param min_circle_radius: minimum potential size of plate circle (in pixels)
+    :param max_circle_radius: maximum potential size of plate circle (in pixels)
+    :param circle_radius_override: use constant circle radius size (recommended)
+    :param draw_debug_crop: show cropping debug detail
+    :param draw_debug_threshold: show threshold operation debug detail
+    :param draw_debug_contours: show contour operation debug detail
+    :param draw_debug_result: show position of fly
+    :param return_debug_result: return the debug image showing the calculate position of the fly
+    :return: tuple of 2 ints: position of the fly in the cropped image (standardised), or None on failure
+    """
+
+    input_img = cv.imread(image_path)
+
+    # Make greyscale
+    greyscale_img = cv.cvtColor(input_img, cv.COLOR_BGR2GRAY)
+
+    # Contrast phase (helps with circle detection)
+    greyscale_img = cv.convertScaleAbs(greyscale_img, alpha=2, beta=-50)
+
+    # Get image dimensions
+    img_height, img_width = greyscale_img.shape
+
+    # Detect circles in the image
+    #                         image             method       accumulator    minDist
+    circles = cv.HoughCircles(greyscale_img, cv.HOUGH_GRADIENT,  1.2,         100, minRadius=min_circle_radius, maxRadius=max_circle_radius)
+
+    if circles is None or len(circles) == 0:
+        print(f"Couldn't find any circles in image: {image_path}")
+        return
+
+    if len(circles) > 1:
+        print(f"Too many circles in image: {image_path}")
+        return
+
+    # convert the (x, y) coordinates and radius of the circles to integers, and find crop rectangle
+    circle_x, circle_y, circle_radius = np.round(circles[0, :]).astype("int")[0]
+
+    # Make constant radius between shapes
+    if circle_radius_override is not None:
+        circle_radius = circle_radius_override
+
+    crop_radius = circle_radius + crop_margin
+    crop_rect = [circle_x - crop_radius, circle_y - crop_radius, circle_x + crop_radius, circle_y + crop_radius]
+    crop_centre = (crop_radius, crop_radius) # Centre in cropped coordinates
+
+    if draw_debug_crop:
+        # draw debug circle and crop rectangle
+        debug_img = input_img.copy()
+        cv.circle(debug_img, (circle_x, circle_y), circle_radius, (0, 255, 0), 4)
+        cv.rectangle(debug_img, (crop_rect[0], crop_rect[1]),(crop_rect[2], crop_rect[3]), (0, 128, 255), thickness=5)
+        cv.imshow("Crop Debug", debug_img)
+
+    # Pad image with white to allow cropping to a square
+    padding = list(map(lambda a: max(a, 0), [
+        -crop_rect[1],               # Top
+        crop_rect[3] - img_height,   # Bottom
+        -crop_rect[0],               # Left
+        crop_rect[2] - img_width     # Right
+    ]))
+
+    # Shift y by top padding
+    crop_rect[1] += padding[0]
+    crop_rect[3] += padding[0]
+    # Shift x by left padding
+    crop_rect[0] += padding[2]
+    crop_rect[2] += padding[2]
+    padded = cv.copyMakeBorder(input_img, *padding, cv.BORDER_CONSTANT, value=[255,255,255])
+
+    # To crop image in rect:
+    # (min_x, max_x, min_y, max_y): image[min_y:max_y, min_x:max_x]
+    cropped = padded[crop_rect[1]:crop_rect[3], crop_rect[0]:crop_rect[2]].copy()
+
+    # White out circles
+    radius = int(crop_radius*SQRT_2)
+    circle_margin = 10
+    thickness = int(2*crop_radius*(SQRT_2-1))+circle_margin
+    cv.circle(cropped, crop_centre, radius, (255,255,255), thickness=thickness)
+
+    # Find binary threshold
+    grey_cropped = cv.cvtColor(cropped, cv.COLOR_BGR2GRAY)
+    blurred_cropped = cv.GaussianBlur(grey_cropped, (11, 11), sigmaX=5, borderType=cv.BORDER_DEFAULT)
+    _, thresh = cv.threshold(blurred_cropped, 100, 255, type=cv.THRESH_BINARY_INV)
+
+    if draw_debug_threshold:
+        cv.imshow("Threshold", thresh)
+
+    # Find contours
+    contours, _ = cv.findContours(thresh, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)#, offset=(x-r-crop_margin,y-r-crop_margin))
+
+    if len(contours) == 0:
+        print(f"Error: no contours in image {image_path}")
+        return
+
+    # Find largest contour by area (which is the fly)
+    largest_contour = max(contours, key=cv.contourArea)
+
+    ((fly_x, fly_y), fly_radius) = cv.minEnclosingCircle(largest_contour)
+
+    if fly_radius <= 2:
+        print(f"Error: fly too small in image {image_path}")
+        return
+
+    fly_centre = (int(fly_x), int(fly_y))
+    fly_radius = int(fly_radius)
+
+    if draw_debug_contours:
+        cont_img = cv.drawContours(cropped.copy(), contours, -1, (0, 255, 0), 3)
+        cv.imshow("Debug Contours", cont_img)
+
+    # Draw where the fly is
+    if draw_debug_result:
+        cv.circle(cropped, fly_centre, fly_radius, (255, 0, 100), 4)
+        cv.rectangle(cropped, (fly_centre[0]-5, fly_centre[1]-5), (fly_centre[0]+5,fly_centre[1]+5), color=(0, 0, 255), thickness=cv.FILLED)
+
+    if return_debug_result:
+        return cropped
+    elif draw_debug_result:
+        # Show the output image
+        cv.imshow("Output", cropped)
+
+    if draw_debug_crop or draw_debug_threshold or draw_debug_contours or draw_debug_result:
+        cv.waitKey(0)
+
+    return fly_centre
 
 
 def plate_coord_to_num(plate_x: int, plate_y: int) -> int:
@@ -170,8 +320,9 @@ def find_death_date(plate_well_path: Path,
 def run(top_image_path: Path = Path.cwd,
         output_csv_filepath: Path = Path.cwd,
         save_continuously=True,
-        start_from: Optional[str]=None):
+        start_from: Optional[str] = None):
     """
+    Runs the script on the image directory.
 
     :param top_image_path: path to the directory containing all the output images
     :param output_csv_filepath: path to the output csv file
@@ -239,6 +390,7 @@ def run(top_image_path: Path = Path.cwd,
             if save_continuously:
                 output_file.flush()
 
+
 def main(output_filename: str = "flyspotter_output.csv"):
     # Get input and output directories
     top_image_path = input_valid_directory_path("Path to images: ")
@@ -247,9 +399,10 @@ def main(output_filename: str = "flyspotter_output.csv"):
     run(top_image_path, output_csv_file_path, save_continuously=True)
 
 
-
-
 def check_plate_circles():
+    """
+    Debug script to output calculated fly positions for a dataset.
+    """
     top_image_path = Path("C:/Users/Ben/Desktop/robottrial")
     image_dir_name = top_image_path.name
     dest_dir = "robottrial_circle_debug_2"
@@ -271,7 +424,6 @@ def check_plate_circles():
             circle_image = find_fly(str(image_path), crop_margin=-10, draw_debug_result=True, return_debug_result=True)
             if circle_image is not None:
                 cv.imwrite(image_dest_path_str, circle_image)
-
 
 
 if __name__ == "__main__":
