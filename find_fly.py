@@ -1,6 +1,10 @@
 import numpy as np
 import cv2 as cv
 from pathlib import Path
+from typing import Tuple, Optional
+
+SQRT_2 = np.sqrt(2)
+
 
 def debug_draw_circles(imageName: str, show_result=False):
     input_img = cv.imread(imageName)
@@ -33,20 +37,18 @@ def debug_draw_circles(imageName: str, show_result=False):
     return input_img
 
 
-
-
 def find_fly(image_path: str,
-             crop_margin = 0,
-             min_circle_radius = 200,
-             max_circle_radius = 400,
-             circle_radius_override = 250,
+             crop_margin=-10,
+             min_circle_radius=200,
+             max_circle_radius=400,
+             circle_radius_override=250,
              draw_debug_crop=False,
              draw_debug_threshold=False,
              draw_debug_contours=False,
              draw_debug_result=False,
-             return_debug_result=False) -> (int, int):
+             return_debug_result=False) -> Optional[Tuple[int, int]]:
     """
-    Finds the position of a fly in an image, by first cropping to a standard size.
+    Finds the position of a fly in an image, by first cropping to a standard size. Defaults tested on 800x600 image size
     :param image_path: path to the image
     :param crop_margin: margin around plate circle to use for cropping to standard size (in pixels)
     :param min_circle_radius: minimum potential size of plate circle (in pixels)
@@ -56,26 +58,17 @@ def find_fly(image_path: str,
     :param draw_debug_threshold: show threshold operation debug detail
     :param draw_debug_contours: show contour operation debug detail
     :param draw_debug_result: show position of fly
-    :param return_debug_result: return the debug image of the fly
+    :param return_debug_result: return the debug image showing the calculate position of the fly
     :return: tuple of 2 ints: position of the fly in the cropped image (standardised), or None on failure
     """
 
     input_img = cv.imread(image_path)
 
-    # Contrast phase (helps with circle detection)
-    #contrast = cv.convertScaleAbs(input_img, alpha=2, beta=-50)
-
-    # Sharpen phase (also helps with circle detection)
-    # https://en.wikipedia.org/wiki/Kernel_(image_processing)
-    sharpen_kernel = np.array([[0, -1, 0],
-                               [-1, 5, -1],
-                               [0, -1, 0]])
-
-    #sharp_img = cv.filter2D(src=input_img, ddepth=-1, kernel=sharpen_kernel)
-    #cv.imshow("Sharp Debug", sharp_img)
-
     # Make greyscale
     greyscale_img = cv.cvtColor(input_img, cv.COLOR_BGR2GRAY)
+
+    # Contrast phase (helps with circle detection)
+    greyscale_img = cv.convertScaleAbs(greyscale_img, alpha=2, beta=-50)
 
     # Get image dimensions
     img_height, img_width = greyscale_img.shape
@@ -95,11 +88,13 @@ def find_fly(image_path: str,
     # convert the (x, y) coordinates and radius of the circles to integers, and find crop rectangle
     circle_x, circle_y, circle_radius = np.round(circles[0, :]).astype("int")[0]
 
+    # Make constant radius between shapes
     if circle_radius_override is not None:
         circle_radius = circle_radius_override
 
     crop_radius = circle_radius + crop_margin
     crop_rect = [circle_x - crop_radius, circle_y - crop_radius, circle_x + crop_radius, circle_y + crop_radius]
+    crop_centre = (crop_radius, crop_radius) # Centre in cropped coordinates
 
     if draw_debug_crop:
         # draw debug circle and crop rectangle
@@ -124,8 +119,15 @@ def find_fly(image_path: str,
     crop_rect[2] += padding[2]
     padded = cv.copyMakeBorder(input_img, *padding, cv.BORDER_CONSTANT, value=[255,255,255])
 
-    # To crop image in rect (min_x, max_x, min_y, max_y): image[min_y:max_y, min_x:max_x]
+    # To crop image in rect:
+    # (min_x, max_x, min_y, max_y): image[min_y:max_y, min_x:max_x]
     cropped = padded[crop_rect[1]:crop_rect[3], crop_rect[0]:crop_rect[2]].copy()
+
+    # White out circles
+    radius = int(crop_radius*SQRT_2)
+    circle_margin = 10
+    thickness = int(2*crop_radius*(SQRT_2-1))+circle_margin
+    cv.circle(cropped, crop_centre, radius, (255,255,255), thickness=thickness)
 
     # Find binary threshold
     grey_cropped = cv.cvtColor(cropped, cv.COLOR_BGR2GRAY)
@@ -138,13 +140,17 @@ def find_fly(image_path: str,
     # Find contours
     contours, _ = cv.findContours(thresh, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)#, offset=(x-r-crop_margin,y-r-crop_margin))
 
+    if len(contours) == 0:
+        print(f"Error: no contours in image {image_path}")
+        return
+
     # Find largest contour by area (which is the fly)
     largest_contour = max(contours, key=cv.contourArea)
 
     ((fly_x, fly_y), fly_radius) = cv.minEnclosingCircle(largest_contour)
 
     if fly_radius <= 2:
-        print("Error: fly too small")
+        print(f"Error: fly too small in image {image_path}")
         return
 
     fly_centre = (int(fly_x), int(fly_y))
@@ -157,7 +163,7 @@ def find_fly(image_path: str,
     # Draw where the fly is
     if draw_debug_result:
         cv.circle(cropped, fly_centre, fly_radius, (255, 0, 100), 4)
-        cv.rectangle(cropped, (fly_centre[0]-5,fly_centre[1]-5), (fly_centre[0]+5,fly_centre[1]+5), color=(0, 0, 255), thickness=cv.FILLED)
+        cv.rectangle(cropped, (fly_centre[0]-5, fly_centre[1]-5), (fly_centre[0]+5,fly_centre[1]+5), color=(0, 0, 255), thickness=cv.FILLED)
 
     if return_debug_result:
         return cropped
@@ -170,8 +176,9 @@ def find_fly(image_path: str,
 
     return fly_centre
 
+
 if __name__ == "__main__":
-    image_path = "C:/Users/Ben/Desktop/robottrial/1-1-E1/22-1-1-E1-2021_11_27_07_41_35-0.jpg"
+    input_image_path = "C:/Users/Ben/Desktop/robottrial/1-1-A4/54-1-1-A4-2021_11_28_15_40_36-0.jpg"
 
     # Requires initial image processing to detect circles:
     # "C:/Users/Ben/Desktop/robottrial/1-1-F5/7-1-1-F5-2021_11_26_16_41_57-0.jpg"
@@ -179,10 +186,10 @@ if __name__ == "__main__":
     #debug_draw_circles(image_path, show_result=True)
 
     fly_pos = find_fly(
-        image_path,
-        crop_margin=-10,
-        min_circle_radius=0,
-        max_circle_radius=400000,
+        input_image_path,
+        crop_margin=0,
+        #min_circle_radius=0,
+        #max_circle_radius=400000,
         draw_debug_crop=True,
         draw_debug_threshold=True,
         draw_debug_contours=True,
